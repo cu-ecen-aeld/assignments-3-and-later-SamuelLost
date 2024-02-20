@@ -1,3 +1,4 @@
+#!/bin/sh
 # 9) Escreva um script de shell finder-app/finder.sh conforme descrito abaixo:
 
 # Aceita os seguintes argumentos de tempo de execução: o primeiro argumento é um caminho para um diretório no sistema de arquivos, chamado abaixo de filesdir; 
@@ -13,6 +14,7 @@
 
 # Exemplo de uso:
 # finder.sh /tmp/aesd/assignment1 linux
+
 
 filesdir=$1
 searchstr=$2
