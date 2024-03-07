@@ -168,7 +168,7 @@ int setup_socket(void) {
  * - errno on error
  * - RET_OK when succeeded
  */
-int file_send(void) {
+int send_file(void) {
     /* Send complete file */
     fseek(pf_data_file, 0, SEEK_SET);
     char read_buffer[READ_BUFF_SIZE];
@@ -252,11 +252,11 @@ int main(int argc, char **argv)
         deamon = true;
     }
 
-    if (setup_signals() != 0) {
+    if ((ret = setup_signals()) != 0) {
         do_exit(ret);
     }
 
-    if (setup_datafile() != 0) {
+    if ((ret = setup_datafile()) != 0) {
         do_exit(ret);
     }
 
@@ -267,7 +267,7 @@ int main(int argc, char **argv)
 
     if (deamon) {
         printf("Demonizing, listening on port %s\n", pc_port);
-        if (daemonize() != 0) {
+        if ((ret = daemonize()) != 0) {
             do_exit(ret);
         }
     }
@@ -324,7 +324,7 @@ int main(int argc, char **argv)
                         do_exit(ret);
                     }
 
-                    if ((ret = file_send()) != 0) {
+                    if ((ret = send_file()) != 0) {
                         do_exit(ret);
                     }
                 }
