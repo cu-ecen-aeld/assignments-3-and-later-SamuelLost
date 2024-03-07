@@ -1,195 +1,419 @@
-//Reference: https://stackoverflow.com/questions/54718687/how-do-i-use-sigaction-struct-sigaction-is-not-defined
-#define _POSIX_C_SOURCE 200112L
-#define _POSIX_SOURCE
-//--------------------
-#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
 #include <errno.h>
+#include <syslog.h>
+#include <signal.h>
+#include <unistd.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <syslog.h>
-#include <sys/stat.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <bits/socket.h>
 
-#define PORT 9000
-#define MAX_CONNECTIONS 10
-#define BUFFER_SIZE 512
-const char* log_path = "/var/tmp/aesdsocketdata";
-bool accept_connections = true;
-extern int errno;
-int signal_caught = 0;
-int socket_fd = 0;
+/*
+2. Create a socket based program with name aesdsocket in the “server” directory which:
+     a. Is compiled by the “all” and “default” target of a Makefile in the “server” directory and supports cross
+     compilation, placing the executable file in the “server” directory and named aesdsocket.
+     b. Opens a stream socket bound to port 9000, failing and returning -1 if any of the socket connection steps fail.
+     c. Listens for and accepts a connection
+     d. Logs message to the syslog “Accepted connection from xxx” where XXXX is the IP address of the connected client.
+     e. Receives data over the connection and appends to file /var/tmp/aesdsocketdata, creating this file if it doesn’t
+     exist.
+        - Your implementation should use a newline to separate data packets received.  In other words a packet is
+        considered complete when a newline character is found in the input receive stream, and each newline should
+        result in an append to the /var/tmp/aesdsocketdata file.
+        - You may assume the data stream does not include null characters (therefore can be processed using string
+        handling functions).
+        - You may assume the length of the packet will be shorter than the available heap size.  In other words, as
+        long as you handle malloc() associated failures with error messages you may discard associated over-length
+        packets.
+     f. Returns the full content of /var/tmp/aesdsocketdata to the client as soon as the received data packet completes.
+            - You may assume the total size of all packets sent (and therefore size of /var/tmp/aesdsocketdata) will
+            be less than the size of the root filesystem, however you may not assume this total size of all packets
+            sent will be less than the size of the available RAM for the process heap.
+     g. Logs message to the syslog “Closed connection from XXX” where XXX is the IP address of the connected client.
+     h. Restarts accepting connections from new clients forever in a loop until SIGINT or SIGTERM is received
+     (see below).
+     i. Gracefully exits when SIGINT or SIGTERM is received, completing any open connection operations, closing any
+     open sockets, and deleting the file /var/tmp/aesdsocketdata.
+    - Logs message to the syslog “Caught signal, exiting” when SIGINT or SIGTERM is received.
+*/
 
-void signal_handler(int signal) {
-    syslog(LOG_USER, "Caught signal: %d", signal);
-    if(close(socket_fd) == -1) {
-        syslog(LOG_USER, "Error closing socket: %s", strerror(errno));
+#define SOCKET_FAIL -1
+#define RET_OK 0
+
+char *pcDataFilePath = "/var/tmp/aesdsocketdata";
+FILE *pfDataFile = NULL;
+
+#define BACKLOG 10
+char *pcPort = "9000";
+struct addrinfo *servinfo = NULL;
+int sfd = 0;
+int sockfd = 0;
+
+#define RECV_BUFF_SIZE 1024
+#define READ_BUFF_SIZE 1024
+
+/* completing any open connection operations,
+ * closing any open sockets, and deleting the file /var/tmp/aesdsocketdata*/
+void exit_cleanup(void)
+{
+
+    /* Cleanup with reentrant functions only*/
+
+    /* Remove datafile */
+    if (pfDataFile != NULL)
+    {
+        close(fileno(pfDataFile));
+        unlink(pcDataFilePath);
     }
-    closelog();
-    remove(log_path);
+
+    /* Close socket */
+    if (sfd >= 0)
+    {
+        close(sfd);
+    }
+
+    /* Close socket */
+    if (sockfd >= 0)
+    {
+        close(sockfd);
+    }
+}
+
+/* Signal actions with cleanup */
+void sig_handler(int signo, siginfo_t *info, void *context)
+{
+    int errno_saved = errno;
+
+    if (signo == SIGINT)
+    {
+        syslog(LOG_DEBUG, "Caught signal, exiting");
+        printf("caught SIGINT\n");
+    }
+    else if (signo == SIGTERM)
+    {
+        syslog(LOG_DEBUG, "Caught signal, exiting");
+        printf("caught SIGTERM\n");
+    }
+    errno = errno_saved;
+    exit_cleanup();
     exit(EXIT_SUCCESS);
 }
 
-// reference : https://beej.us/guide/bgnet/html/
-void *get_in_addr(struct sockaddr *sa) {
-    if(sa->sa_family == AF_INET) {
-        return &(((struct sockaddr_in*)sa)->sin_addr);
-    }
-    return &(((struct sockaddr_in6*)sa)->sin6_addr);
+void do_exit(int exitval)
+{
+    exit_cleanup();
+    exit(exitval);
 }
 
-int main(int argc, char* argv[]) {
-    struct sockaddr_storage client_addr;
-    const char *tag = "AESD-SOCKET";
-    openlog(tag, LOG_PID, LOG_USER);
-    struct addrinfo hints, *res;
-    int status;
-    
-    struct sigaction sa = {.sa_handler = signal_handler};
-    if(sigaction(SIGINT, &sa, NULL) == -1) {
-        syslog(LOG_USER, "Error setting up signal handler: %s", strerror(errno));
-        closelog();
-        return -1;
-    }
-    if(sigaction(SIGTERM, &sa, NULL) == -1) {
-        syslog(LOG_USER, "Error setting up signal handler: %s", strerror(errno));
-        closelog();
-        return -1;
-    }
+/* Description:
+ * Setup signals to catch
+ *
+ * Return:
+ * - errno on error
+ * - RET_OK when succeeded
+ */
+int setup_signals(void)
+{
 
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
-    hints.ai_protocol = 0;
+    /* SIGINT or SIGTERM terminates the program with cleanup */
+    struct sigaction sSigAction = {0};
 
-    if((status = getaddrinfo(NULL, "9000", &hints, &res)) != 0) {
-        syslog(LOG_USER, "Error getting address info: %s", gai_strerror(status));
-        closelog();
-        freeaddrinfo(res);
-        return -1;
+    sSigAction.sa_sigaction = &sig_handler;
+    if (sigaction(SIGINT, &sSigAction, NULL) != 0)
+    {
+        perror("Setting up SIGINT");
+        return errno;
+    }
+    if (sigaction(SIGTERM, &sSigAction, NULL) != 0)
+    {
+        perror("Setting up SIGTERM");
+        return errno;
     }
 
-    if((socket_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) == -1) {
-        syslog(LOG_USER, "Error creating socket: %s", strerror(errno));
-        closelog();
-        freeaddrinfo(res);
-        return -1;
-    }
-    freeaddrinfo(res);
+    return RET_OK;
+}
 
-    if(argc > 1) {
-        printf("Argument: %s\n", argv[1]);
-        if(!strcmp(argv[1], "-d")) {
-            syslog(LOG_USER, "Daemonizing the process");
-            pid_t pid = fork();
-            if(pid == -1) {
-                syslog(LOG_USER, "Error forking the process: %s", strerror(errno));
-                close(socket_fd);
-                closelog();
-                return -1;
-            } else if (pid > 0) {
-                printf("Parent process exiting\n");
-                exit(EXIT_SUCCESS);
-            } else {
-                if(setsid() == -1) {
-                    syslog(LOG_USER, "Error creating new session: %s", strerror(errno));
-                    close(socket_fd);
-                    closelog();
-                    return -1;
+/* Description:
+ * Setup datafile to use
+ *
+ * Return:
+ * - errno on error
+ * - RET_OK when succeeded
+ */
+int setup_datafile(void)
+{
+    /* Create and open destination file */
+
+    if ((pfDataFile = fopen(pcDataFilePath, "w+")) == NULL)
+    {
+        perror("fopen: %s");
+        printf("Error opening: %s", pcDataFilePath);
+        return errno;
+    }
+
+    return RET_OK;
+}
+
+/* Description:
+ * Setup socket handling
+ * https://beej.us/guide/bgnet/html/split/system-calls-or-bust.html#system-calls-or-bust
+ *
+ * Return:
+ * - errno on error
+ * - RET_OK when succeeded
+ */
+int setup_socket(void)
+{
+
+    struct addrinfo hints;
+    int yes = 1; // for setsockopt() SO_REUSEADDR, below
+
+    memset(&hints, 0, sizeof hints); // make sure the struct is empty
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM; // TCP stream sockets
+    hints.ai_flags = AI_PASSIVE;     // bind to all interfaces
+
+    if ((getaddrinfo(NULL, pcPort, &hints, &servinfo)) != 0)
+    {
+        perror("getaddrinfo");
+        return errno;
+    }
+
+    if ((sfd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol)) < 0)
+    {
+        perror("socket");
+        return errno;
+    }
+
+    if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) < 0)
+    {
+        perror("setsockopt");
+        return errno;
+    }
+
+    if (bind(sfd, servinfo->ai_addr, servinfo->ai_addrlen) < 0)
+    {
+        perror("bind");
+        return errno;
+    }
+
+    /* Not needed anymore */
+    freeaddrinfo(servinfo);
+
+    if (listen(sfd, BACKLOG) < 0)
+    {
+        perror("listen");
+        return errno;
+    }
+
+    return RET_OK;
+}
+
+/* Description:
+ * Send complete file through socket to the client
+ *
+ * Return:
+ * - errno on error
+ * - RET_OK when succeeded
+ */
+int file_send(void)
+{
+    /* Send complete file */
+    fseek(pfDataFile, 0, SEEK_SET);
+    char acReadBuff[READ_BUFF_SIZE];
+    while (!feof(pfDataFile))
+    {
+        // NOTE: fread will return nmemb elements
+        // NOTE: fread does not distinguish between end-of-file and error,
+        int iRead = fread(acReadBuff, 1, sizeof(acReadBuff), pfDataFile);
+        if (ferror(pfDataFile) != 0)
+        {
+            perror("read");
+            return errno;
+        }
+
+        if (send(sockfd, acReadBuff, iRead, 0) < 0)
+        {
+            perror("send");
+            return errno;
+        }
+    }
+
+    return RET_OK;
+}
+
+/* Description:
+ * Write buff with size to datafile
+ *
+ * Return:
+ * - errno on error
+ * - RET_OK when succeeded
+ */
+int file_write(void *buff, int size)
+{
+    /* Append received data */
+    fseek(pfDataFile, 0, SEEK_END);
+    fwrite(buff, size, 1, pfDataFile);
+    if (ferror(pfDataFile) != 0)
+    {
+        perror("write");
+        return errno;
+    }
+
+    return RET_OK;
+}
+
+int daemonize(void)
+{
+
+    umask(0);
+
+    pid_t pid;
+    if ((pid = fork()) < 0)
+    {
+        perror("fork");
+        return errno;
+    }
+    else if (pid != 0)
+    {
+        /* Exit parent */
+        exit(EXIT_SUCCESS);
+    }
+
+    if (setsid() < 0) {
+        perror("chdir");
+        return errno;
+    }
+
+    if (chdir("/") < 0)
+    {
+        perror("chdir");
+        return errno;
+    }
+
+    open("/dev/null", O_RDWR);
+    dup(0);
+    dup(0);
+
+    return RET_OK;
+}
+
+int main(int argc, char **argv)
+{
+
+    int iDeamon = false;
+    int iRet = 0;
+    /* init syslog */
+    openlog(NULL, 0, LOG_USER);
+
+    if ((argc > 1) && strcmp(argv[0], "-d"))
+    {
+        iDeamon = true;
+    }
+
+    if ((iRet = setup_signals()) != 0)
+    {
+        do_exit(iRet);
+    }
+
+    if ((iRet = setup_datafile()) != 0)
+    {
+        do_exit(iRet);
+    }
+
+    /* Opens a stream socket, failing and returning -1 if any of the socket connection steps fail. */
+    if (setup_socket() != 0)
+    {
+        do_exit(SOCKET_FAIL);
+    }
+
+    if (iDeamon)
+    {
+        printf("Demonizing, listening on port %s\n", pcPort);
+        if ((iRet = daemonize() != 0))
+        {
+            do_exit(iRet);
+        }
+    }
+    else
+    {
+        printf("Waiting for connections...\n");
+    }
+
+    /* Keep receiving clients */
+    while (1)
+    {
+
+        /* Accept clients */
+        struct sockaddr_storage their_addr;
+        socklen_t addr_size;
+        if ((sockfd = accept(sfd, (struct sockaddr *)&their_addr, &addr_size)) < 0)
+        {
+            perror("accept");
+            sleep(1);
+            continue;
+        }
+
+        /* Get IP connecting client */
+        struct sockaddr_in *sin = (struct sockaddr_in *)&their_addr;
+        unsigned char *ip = (unsigned char *)&sin->sin_addr.s_addr;
+        syslog(LOG_DEBUG, "Accepted connection from %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+
+        /* Keep receiving data until error or disconnect*/
+        int iReceived = 0;
+        char acRecvBuff[RECV_BUFF_SIZE];
+        while (1)
+        {
+            iReceived = recv(sockfd, &acRecvBuff, sizeof(acRecvBuff), 0);
+            if (iReceived < 0)
+            {
+                perror("recv");
+                do_exit(errno);
+            }
+            else if (iReceived == 0)
+            {
+                close(sockfd);
+                syslog(LOG_DEBUG, "Closed connection from %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+                break;
+            }
+            else if (iReceived > 0)
+            {
+
+                char *pcEnd = NULL;
+                pcEnd = strstr(acRecvBuff, "\n");
+                if (pcEnd == NULL)
+                {
+                    /* not end of message, write all */
+                    int ret = 0;
+                    if ((ret = file_write(acRecvBuff, iReceived)) != 0)
+                    {
+                        do_exit(ret);
+                    }
                 }
-                chdir("/");
-                // Redirecting standard input, output and error to /dev/null
-                open("/dev/null", O_RDWR);
-                dup(0); // stdin
-                dup(0); // stdout
-                dup(0); // stderr
-            }
-        }
-    }
-    
-    if((status = listen(socket_fd, MAX_CONNECTIONS)) == -1) {
-        syslog(LOG_USER, "Error listening on socket: %s", strerror(errno));
-        close(socket_fd);
-        closelog();
-        return -1;
-    }
-    socklen_t client_addr_len = sizeof(client_addr);
-    while(true) {
-        int client_fd = accept(socket_fd, (struct sockaddr*)&client_addr, &client_addr_len);
-        if(client_fd == -1) {
-            syslog(LOG_USER, "Error accepting connection: %s", strerror(errno));
-            close(socket_fd);
-            closelog();
-            return -1;
-        }
-        char client_ip[INET6_ADDRSTRLEN];
-        inet_ntop(client_addr.ss_family, get_in_addr((struct sockaddr*)&client_addr), client_ip, sizeof(client_ip));
-        syslog(LOG_USER, "Accepted connection from %s", client_ip);
-        char buffer[BUFFER_SIZE];
-        bool packet_complete = false;
-        int bytes_received, bytes_sent = 0;
-        int log_fd = open(log_path, O_CREAT | O_WRONLY | O_APPEND, 0644);
-        if(log_fd == -1) {
-            syslog(LOG_USER, "Error opening log file: %s", strerror(errno));
-            close(client_fd);
-            close(socket_fd);
-            closelog();
-            return -1;
-        }
+                else
+                {
+                    /* end of message detected, write until message end */
+                    int ret = 0;
 
-        while(!packet_complete) {
-            bytes_received = recv(client_fd, buffer, BUFFER_SIZE, 0);
-            if(bytes_received == -1) {
-                syslog(LOG_USER, "Error receiving data: %s", strerror(errno));
-                close(client_fd);
-                break;
-            } else if(bytes_received == 0 || (strchr(buffer, '\n') != NULL)) {
-                packet_complete = true;
-            }
+                    // NOTE: Ee know that message end is in the buffer, so +1 here is allowed to
+                    // also get the end of message '\n' in the file.
+                    if ((ret = file_write(acRecvBuff, (int)(pcEnd - acRecvBuff + 1))) != 0)
+                    {
+                        do_exit(ret);
+                    }
 
-            bytes_sent = write(log_fd, buffer, bytes_received);
-            if(bytes_sent != bytes_received) {
-                syslog(LOG_USER, "Error writing to log file: %s", strerror(errno));
-                close(client_fd);
-                close(log_fd);
-                break;
+                    if ((ret = file_send()) != 0)
+                    {
+                        do_exit(ret);
+                    }
+                }
             }
         }
-        packet_complete = false;
-        lseek(log_fd, 0, SEEK_SET);
-        while(!packet_complete) {
-            bytes_received = read(log_fd, buffer, BUFFER_SIZE);
-            if(bytes_received == -1) {
-                syslog(LOG_USER, "Error reading from log file: %s", strerror(errno));
-                close(client_fd);
-                close(log_fd);
-                break;
-            } else if(bytes_received == 0) {
-                packet_complete = true;
-            }
-            bytes_sent = send(client_fd, buffer, bytes_received, 0);
-            if(bytes_sent != bytes_received) {
-                syslog(LOG_USER, "Error sending data: %s", strerror(errno));
-                close(client_fd);
-                close(log_fd);
-                break;
-            }
-        }
-        close(client_fd);
-        close(log_fd);   
     }
-    close(socket_fd);
-    closelog();
-    remove(log_path);
-    return 0;    
+
+    do_exit(RET_OK);
 }
-
